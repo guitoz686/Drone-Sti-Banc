@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Banc de poussée ESC</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--txt:#1b1f24;--mut:#667085;--bd:#dde1e7;--force:#2a7de1;--thr:#f08a24;--ok:#1a9d5b;--bad:#d92d20}
+@media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1d2127;--txt:#e8ebef;--mut:#98a2b3;--bd:#2f353d;--force:#5aa9ff;--thr:#f6a04d;--ok:#3ccf84;--bad:#ff6b5e}}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--txt);font:15px system-ui,Segoe UI,sans-serif}
+h1{font-size:18px;margin:0}
+header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.pill{padding:3px 10px;border-radius:99px;border:1px solid var(--bd);font-size:13px;color:var(--mut)}
+.pill.on{color:var(--ok);border-color:var(--ok)}.pill.off{color:var(--bad);border-color:var(--bad)}
+button,input,select{font:inherit;color:inherit;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:7px 12px}
+button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}
+button.pri{background:var(--force);color:#fff;border-color:var(--force)}
+button.bad{background:var(--bad);color:#fff;border-color:var(--bad);font-weight:600}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px 12px}
+.card small{color:var(--mut);display:block}.card b{font-size:24px;font-variant-numeric:tabular-nums}
+.box{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:12px}
+canvas{width:100%;height:300px;display:block}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.row+.row{margin-top:10px}
+input[type=range]{flex:1;min-width:200px;padding:0}
+input[type=number]{width:90px}
+#log{height:130px;overflow:auto;font:12px ui-monospace,Consolas,monospace;color:var(--mut);white-space:pre-wrap}
+#log .err{color:var(--bad)}
+.leg i{display:inline-block;width:12px;height:3px;margin:0 4px 3px 10px;vertical-align:middle}
+</style>
+</head>
+<body>
+<header>
+  <h1>Banc de poussée ESC</h1>
+  <button id="conn" class="pri">Connecter l’Arduino</button>
+  <span id="state" class="pill off">Déconnecté</span>
+  <span id="armed" class="pill off">Désarmé</span>
+  <span class="pill">Chrome ou Edge requis · fermer le moniteur série de l’IDE</span>
+</header>
+
+<div class="cards">
+  <div class="card"><small>Gaz</small><b id="vPct">–</b></div>
+  <div class="card"><small>Impulsion</small><b id="vUs">–</b></div>
+  <div class="card"><small>Poussée</small><b id="vG">–</b></div>
+  <div class="card"><small>Poussée</small><b id="vN">–</b></div>
+  <div class="card"><small>Maximum</small><b id="vMax">–</b></div>
+</div>
+
+<div class="box">
+  <div class="row" style="justify-content:space-between;margin-bottom:6px">
+    <span class="leg"><i style="background:var(--force)"></i>Poussée (g, axe gauche)<i style="background:var(--thr)"></i>Gaz (%, axe droit)</span>
+    <span class="row">Fenêtre
+      <select id="win"><option value="15">15 s</option><option value="30" selected>30 s</option><option value="60">60 s</option></select>
+      <button id="csv">Exporter CSV</button>
+      <button id="clr">Effacer</button>
+    </span>
+  </div>
+  <canvas id="chart"></canvas>
+</div>
+
+<div class="box">
+  <div class="row">
+    <label><input type="checkbox" id="safe"> Banc fixé, zone dégagée, hélice retirée</label>
+    <button id="arm" data-c>Armer</button>
+    <button id="stop" data-c>Stop (rampe)</button>
+    <button id="disarm" class="bad" data-c>ARRÊT D’URGENCE (Échap)</button>
+  </div>
+  <div class="row">
+    <span>Gaz</span>
+    <input type="range" id="slider" min="0" max="100" value="0" step="1" data-c>
+    <b id="sliderVal" style="width:56px">0 %</b>
+    <label>Limite max <input type="number" id="limit" min="1" max="100" value="100"> %</label>
+  </div>
+  <div class="row">
+    <button id="tare" data-c>Tare</button>
+    <input type="number" id="calG" value="500" min="1"> g
+    <button id="cal" data-c>Calibrer avec ce poids</button>
+    <button id="rmax" data-c>Reset max</button>
+  </div>
+</div>
+
+<div class="box"><div id="log"></div></div>
+
+<script>
+const $=id=>document.getElementById(id);
+let port,writer,reader,loopDone,chain=Promise.resolve();
+let data=[],t0=0,maxG=0,win=30,lastSent=-1,timer=0,connected=false;
+const RE=/t=(\d+) ms \| (\d+) us \| (-?[\d.]+) % \| (-?[\d.]+) g \| (-?[\d.]+) N/;
+
+function log(s,c){const d=document.createElement("div");if(c)d.className=c;d.textContent=s;const l=$("log");l.appendChild(d);while(l.children.length>200)l.firstChild.remove();l.scrollTop=l.scrollHeight}
+function pill(el,on,txt){el.className="pill "+(on?"on":"off");el.textContent=txt}
+function refresh(){document.querySelectorAll("[data-c]").forEach(e=>e.disabled=!connected);$("arm").disabled=!(connected&&$("safe").checked)}
+function setConn(on){connected=on;pill($("state"),on,on?"Connecté":"Déconnecté");$("conn").textContent=on?"Déconnecter":"Connecter l’Arduino";if(!on)pill($("armed"),false,"Désarmé");refresh()}
+function setArmed(a){pill($("armed"),a,a?"ARMÉ":"Désarmé")}
+
+function send(cmd){
+  if(!writer)return Promise.resolve();
+  chain=chain.then(()=>writer.write(new TextEncoder().encode(cmd+"\n"))).catch(e=>log("Envoi impossible : "+e.message,"err"));
+  return chain;
+}
+
+async function connect(){
+  if(!("serial" in navigator)){alert("Web Serial indisponible : utilisez Chrome ou Edge.");return}
+  try{port=await navigator.serial.requestPort();await port.open({baudRate:115200})}
+  catch(e){log("Connexion annulée : "+e.message,"err");return}
+  writer=port.writable.getWriter();
+  t0=performance.now();data=[];maxG=0;lastSent=-1;
+  setConn(true);log("Connecté. Attente du redémarrage de la carte…");
+  loopDone=readLoop();
+  setTimeout(()=>send("stream on"),2500);
+}
+
+async function readLoop(){
+  const dec=new TextDecoderStream();
+  const piped=port.readable.pipeTo(dec.writable).catch(()=>{});
+  reader=dec.readable.getReader();
+  let buf="";
+  try{
+    for(;;){
+      const {value,done}=await reader.read();if(done)break;
+      buf+=value;let i;
+      while((i=buf.indexOf("\n"))>=0){handleLine(buf.slice(0,i).replace(/\r/g,""));buf=buf.slice(i+1)}
+    }
+  }catch(e){log("Lecture interrompue : "+e.message,"err")}
+  try{reader.releaseLock()}catch(e){}
+  await piped;
+  if(connected){setConn(false);log("Liaison perdue.","err")}
+}
+
+async function disconnect(){
+  await send("disarm");
+  connected=false;
+  try{await reader.cancel()}catch(e){}
+  try{await loopDone}catch(e){}
+  try{writer.releaseLock()}catch(e){}
+  try{await port.close()}catch(e){}
+  writer=null;setConn(false);log("Déconnecté.");
+}
+
+function handleLine(l){
+  const m=RE.exec(l);
+  if(m){
+    const t=(performance.now()-t0)/1000,pct=+m[3],g=+m[4],n=+m[5];
+    data.push({t,pct,g,n});if(data.length>50000)data.shift();
+    if(g>maxG)maxG=g;
+    $("vPct").textContent=pct.toFixed(1)+" %";$("vUs").textContent=m[2]+" µs";
+    $("vG").textContent=g.toFixed(1)+" g";$("vN").textContent=n.toFixed(3)+" N";
+    $("vMax").textContent=maxG.toFixed(1)+" g";
+    return;
+  }
+  if(!l.trim())return;
+  log(l);
+  if(/^Armed\./.test(l))setArmed(true);
+  else if(/^Disarmed\./.test(l))setArmed(false);
+  else{const a=/armed=(yes|no)/.exec(l);if(a)setArmed(a[1]==="yes")}
+}
+
+function sendSpeed(){const v=+$("slider").value;if(v!==lastSent){lastSent=v;send("speed "+v)}}
+function setSlider(v){$("slider").value=v;$("sliderVal").textContent=v+" %"}
+
+$("conn").onclick=()=>connected?disconnect():connect();
+$("safe").onchange=refresh;
+$("arm").onclick=()=>{send("arm");log("Armement en cours (3 s)…")};
+$("stop").onclick=()=>{setSlider(0);lastSent=0;send("stop")};
+$("disarm").onclick=()=>{setSlider(0);lastSent=0;send("disarm");setArmed(false)};
+$("slider").oninput=()=>{$("sliderVal").textContent=$("slider").value+" %";if(!timer)timer=setTimeout(()=>{timer=0;sendSpeed()},100)};
+$("slider").onchange=sendSpeed;
+$("limit").onchange=()=>{const l=Math.min(100,Math.max(1,+$("limit").value||100));$("limit").value=l;$("slider").max=l;if(+$("slider").value>l){setSlider(l);sendSpeed()}};
+$("tare").onclick=()=>send("tare");
+$("cal").onclick=()=>{const g=parseFloat($("calG").value);if(g>0)send("cal "+g)};
+$("rmax").onclick=()=>{maxG=0;send("resetmax")};
+$("win").onchange=()=>win=+$("win").value;
+$("clr").onclick=()=>{data=[];maxG=0;t0=performance.now()};
+$("csv").onclick=()=>{
+  const rows=["t_s,gaz_pct,poussee_g,poussee_N",...data.map(d=>[d.t.toFixed(2),d.pct,d.g,d.n].join(","))];
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([rows.join("\n")],{type:"text/csv"}));
+  a.download="poussee_"+new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")+".csv";a.click();
+};
+addEventListener("keydown",e=>{if(e.key==="Escape"&&connected)$("disarm").click()});
+if("serial" in navigator)navigator.serial.addEventListener("disconnect",()=>{if(connected){connected=false;setConn(false);log("Câble débranché.","err")}});
+
+function nice(v){const p=Math.pow(10,Math.floor(Math.log10(v)));const f=v/p;return(f<=1?1:f<=2?2:f<=5?5:10)*p}
+function draw(){
+  const c=$("chart"),dpr=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;
+  if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}
+  const x=c.getContext("2d");x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,w,h);
+  const cs=getComputedStyle(document.documentElement),col=n=>cs.getPropertyValue(n).trim();
+  const L=52,R=40,T=8,B=22,pw=w-L-R,ph=h-T-B;
+  const now=data.length?data[data.length-1].t:0,t1=Math.max(now,win),ts=t1-win;
+  const vis=[];for(let i=data.length-1;i>=0&&data[i].t>=ts;i--)vis.push(data[i]);vis.reverse();
+  let hi=10,lo=0;for(const d of vis){if(d.g>hi)hi=d.g;if(d.g<lo)lo=d.g}
+  hi=nice(hi*1.1);if(lo<0)lo=-nice(-lo*1.1);
+  const X=t=>L+(t-ts)/win*pw,Y=g=>T+ph-(g-lo)/(hi-lo)*ph,YP=p=>T+ph-p/100*ph;
+  x.font="11px system-ui";x.lineWidth=1;
+  for(let i=0;i<=5;i++){
+    const y=T+ph*i/5;x.strokeStyle=col("--bd");x.beginPath();x.moveTo(L,y);x.lineTo(L+pw,y);x.stroke();
+    x.fillStyle=col("--mut");x.textAlign="right";x.fillText((hi-(hi-lo)*i/5).toFixed(hi<20?1:0),L-6,y+4);
+    x.textAlign="left";x.fillText(String(100-20*i),L+pw+6,y+4);
+  }
+  x.textAlign="center";
+  for(let i=0;i<=6;i++){const t=ts+win*i/6;x.fillText(t.toFixed(0)+" s",X(t),h-6)}
+  if(vis.length<2)return;
+  x.save();x.beginPath();x.rect(L,T,pw,ph);x.clip();
+  x.beginPath();x.moveTo(X(vis[0].t),YP(0));for(const d of vis)x.lineTo(X(d.t),YP(d.pct));x.lineTo(X(vis[vis.length-1].t),YP(0));x.closePath();
+  x.globalAlpha=.15;x.fillStyle=col("--thr");x.fill();x.globalAlpha=1;
+  x.strokeStyle=col("--thr");x.lineWidth=1.5;x.beginPath();vis.forEach((d,i)=>i?x.lineTo(X(d.t),YP(d.pct)):x.moveTo(X(d.t),YP(d.pct)));x.stroke();
+  x.strokeStyle=col("--force");x.lineWidth=2.5;x.beginPath();vis.forEach((d,i)=>i?x.lineTo(X(d.t),Y(d.g)):x.moveTo(X(d.t),Y(d.g)));x.stroke();
+  x.restore();
+}
+(function loop(){draw();requestAnimationFrame(loop)})();
+refresh();
+</script>
+</body>
+</html>
